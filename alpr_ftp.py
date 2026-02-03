@@ -11,7 +11,7 @@ import logging
 import os
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pyftpdlib.authorizers import DummyAuthorizer
@@ -70,31 +70,32 @@ known_plates: dict[str, dict] = {}
 # Known plates loading
 # =============================================================================
 
+
 def load_known_plates() -> dict[str, dict]:
     """
     Load known plates from file or environment variable.
     File takes precedence if both are set.
-    
+
     Returns:
         Dictionary mapping plate numbers to metadata.
         Example: {"ABC123": {"owner": "John"}, "XYZ789": {}}
     """
     plates: dict[str, dict] = {}
-    
+
     # Try loading from file first
     if KNOWN_PLATES_FILE:
         file_path = Path(KNOWN_PLATES_FILE)
         if file_path.exists():
             try:
-                with open(file_path, "r") as f:
+                with open(file_path) as f:
                     plates = json.load(f)
                 logger.info(f"Loaded {len(plates)} known plates from {KNOWN_PLATES_FILE}")
                 return plates
-            except (json.JSONDecodeError, IOError) as e:
+            except (OSError, json.JSONDecodeError) as e:
                 logger.error(f"Failed to load known plates from {KNOWN_PLATES_FILE}: {e}")
         else:
             logger.warning(f"Known plates file not found: {KNOWN_PLATES_FILE}")
-    
+
     # Fall back to environment variable
     if KNOWN_PLATES_ENV:
         try:
@@ -103,7 +104,7 @@ def load_known_plates() -> dict[str, dict]:
             return plates
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse KNOWN_PLATES env var: {e}")
-    
+
     return plates
 
 
@@ -111,16 +112,17 @@ def load_known_plates() -> dict[str, dict]:
 # Webhook functionality
 # =============================================================================
 
+
 def call_webhook(plate: str, confidence: float, filename: str, is_known: bool, metadata: dict) -> None:
     """
     Call the configured webhook endpoint.
-    
+
     GET method: Simple trigger, no body (for dumb devices like Shelly relays)
     POST method: JSON payload with full plate data (for Home Assistant, etc.)
     """
     if not WEBHOOK_URL:
         return
-    
+
     try:
         if WEBHOOK_METHOD == "GET":
             # Simple trigger - just hit the URL
@@ -130,7 +132,7 @@ def call_webhook(plate: str, confidence: float, filename: str, is_known: bool, m
             payload = {
                 "plate": plate,
                 "confidence": round(confidence, 2),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "filename": filename,
                 "known": is_known,
                 "metadata": metadata if is_known else {},
@@ -142,11 +144,11 @@ def call_webhook(plate: str, confidence: float, filename: str, is_known: bool, m
                 method="POST",
                 headers={"Content-Type": "application/json"},
             )
-        
+
         with urllib.request.urlopen(req, timeout=10) as response:
             status = response.status
             logger.info(f"WEBHOOK: {WEBHOOK_METHOD} {WEBHOOK_URL} -> {status}")
-            
+
     except urllib.error.HTTPError as e:
         logger.error(f"WEBHOOK ERROR: {WEBHOOK_METHOD} {WEBHOOK_URL} -> {e.code} {e.reason}")
     except urllib.error.URLError as e:
@@ -159,9 +161,9 @@ def should_trigger_webhook(plate: str) -> bool:
     """Determine if webhook should be called based on filter setting."""
     if not WEBHOOK_URL:
         return False
-    
-    is_known = plate.upper() in (p.upper() for p in known_plates.keys())
-    
+
+    is_known = plate.upper() in (p.upper() for p in known_plates)
+
     if WEBHOOK_FILTER == "all":
         return True
     elif WEBHOOK_FILTER == "known":
@@ -177,6 +179,7 @@ def should_trigger_webhook(plate: str) -> bool:
 # ALPR processing
 # =============================================================================
 
+
 def init_alpr() -> ALPR:
     """Initialize ALPR with optimized settings for CPU inference."""
     logger.info("Loading ALPR models (this takes ~3 seconds)...")
@@ -191,28 +194,28 @@ def init_alpr() -> ALPR:
 def process_image(filepath: str) -> None:
     """Process an uploaded image, log detected plates, and trigger webhooks."""
     global alpr
-    
+
     if alpr is None:
         logger.error("ALPR not initialized")
         return
-    
+
     filename = Path(filepath).name
-    
+
     # Skip non-image files
     if not filename.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
         return
-    
+
     try:
         results = alpr.predict(filepath)
-        
+
         if results:
             for result in results:
                 plate = result.ocr.text
                 confidence = result.ocr.confidence * 100
-                
+
                 # Check if plate is known (case-insensitive lookup)
                 plate_upper = plate.upper()
-                is_known = plate_upper in (p.upper() for p in known_plates.keys())
+                is_known = plate_upper in (p.upper() for p in known_plates)
                 metadata = {}
                 if is_known:
                     # Get metadata with case-insensitive key lookup
@@ -220,17 +223,17 @@ def process_image(filepath: str) -> None:
                         if key.upper() == plate_upper:
                             metadata = value
                             break
-                
+
                 # Always log to stdout
                 known_tag = " [KNOWN]" if is_known else ""
                 logger.info(f"PLATE: {plate}{known_tag} | conf: {confidence:.1f}% | file: {filename}")
-                
+
                 # Trigger webhook if filter matches
                 if should_trigger_webhook(plate):
                     call_webhook(plate, confidence, filename, is_known, metadata)
         else:
             logger.info(f"NO PLATE DETECTED | file: {filename}")
-            
+
     except Exception as e:
         logger.error(f"Error processing {filename}: {e}")
 
@@ -239,9 +242,10 @@ def process_image(filepath: str) -> None:
 # FTP server
 # =============================================================================
 
+
 class ALPRFTPHandler(FTPHandler):
     """Custom FTP handler that processes images after upload completes."""
-    
+
     def on_file_received(self, file: str) -> None:
         """Called when a file upload is complete."""
         process_image(file)
@@ -250,48 +254,48 @@ class ALPRFTPHandler(FTPHandler):
 def main() -> None:
     """Start the FTP server with ALPR processing."""
     global alpr, known_plates
-    
+
     # Create upload directory if it doesn't exist
     os.makedirs(FTP_DIR, exist_ok=True)
-    
+
     # Load known plates
     known_plates = load_known_plates()
-    
+
     # Initialize ALPR (loads models into memory)
     alpr = init_alpr()
-    
+
     # Set up FTP authorizer
     authorizer = DummyAuthorizer()
     authorizer.add_user(FTP_USER, FTP_PASS, FTP_DIR, perm="elradfmw")
-    
+
     # Configure FTP handler
     handler = ALPRFTPHandler
     handler.authorizer = authorizer
     handler.passive_ports = range(PASV_MIN, PASV_MAX + 1)
-    
+
     # Create and start FTP server
     server = FTPServer(("0.0.0.0", FTP_PORT), handler)
     server.max_cons = 10
     server.max_cons_per_ip = 5
-    
+
     # Startup logging
     logger.info(f"FTP server starting on port {FTP_PORT}")
     logger.info(f"Passive ports: {PASV_MIN}-{PASV_MAX}")
     logger.info(f"Upload directory: {FTP_DIR}")
     logger.info(f"FTP credentials: {FTP_USER} / {'*' * len(FTP_PASS)}")
-    
+
     if WEBHOOK_URL:
         logger.info(f"Webhook: {WEBHOOK_METHOD} {WEBHOOK_URL} (filter: {WEBHOOK_FILTER})")
     else:
         logger.info("Webhook: disabled")
-    
+
     if known_plates:
         logger.info(f"Known plates: {len(known_plates)} configured")
     else:
         logger.info("Known plates: none configured")
-    
+
     logger.info("Ready to receive images...")
-    
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -301,4 +305,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
